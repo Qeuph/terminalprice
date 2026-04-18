@@ -13,6 +13,7 @@ from models.instrument import Instrument, MarketType
 from ui.chart_widget import ChartWidget
 
 import asyncio
+from datetime import datetime
 
 class SearchModal(ModalScreen):
     market_filter = "ALL"
@@ -33,6 +34,9 @@ class SearchModal(ModalScreen):
             ListView(id="results_list"),
             id="search_container"
         )
+
+    def on_mount(self) -> None:
+        self.query_one("#search_input", Input).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         for btn in self.query(".filter_buttons Button"):
@@ -66,9 +70,18 @@ class SearchModal(ModalScreen):
         list_view = self.query_one("#results_list", ListView)
         await list_view.clear()
         for instrument in results:
-            label = f"{instrument.symbol} - {instrument.name} ({instrument.market_type.value})"
+            market_icon = {
+                MarketType.STOCK: "📈",
+                MarketType.CRYPTO: "₿",
+                MarketType.FOREX: "💱",
+                MarketType.COMMODITY: "📦",
+                MarketType.INDEX: "📊"
+            }.get(instrument.market_type, "❓")
+
+            label = f"{market_icon} [bold]{instrument.symbol}[/] - {instrument.name} ({instrument.currency})"
             if instrument.exchange:
-                label += f" [{instrument.exchange}]"
+                label += f" [[dim]{instrument.exchange}[/]]"
+
             list_view.append(ListItem(Label(label), name=instrument.symbol))
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
@@ -81,6 +94,19 @@ class TerminalPriceApp(App):
         layout: grid;
         grid-size: 2 1;
         grid-columns: 1fr 4fr;
+    }
+    #instrument_header {
+        height: 3;
+        background: $primary;
+        color: $text;
+        content-align: center middle;
+        text-style: bold;
+    }
+    #status_bar {
+        height: 1;
+        background: $accent;
+        color: $text;
+        padding: 0 1;
     }
     #sidebar {
         background: $panel;
@@ -114,6 +140,7 @@ class TerminalPriceApp(App):
         Binding("t", "change_timeframe", "Timeframe"),
         Binding("c", "change_currency", "Currency"),
         Binding("a", "add_to_watchlist", "Add Watchlist"),
+        Binding("d", "remove_from_watchlist", "Remove Watchlist"),
         Binding("plus", "zoom_in", "Zoom In"),
         Binding("minus", "zoom_out", "Zoom Out"),
         Binding("left", "scroll_left", "Scroll Left"),
@@ -134,6 +161,7 @@ class TerminalPriceApp(App):
         self.last_search_results = []
         self.watchlist = []
         self.recent = []
+        self._data_cache = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -146,6 +174,7 @@ class TerminalPriceApp(App):
             with Vertical():
                 yield Static(id="instrument_header")
                 yield ChartWidget(id="main_chart")
+                yield Static(id="status_bar")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -162,12 +191,23 @@ class TerminalPriceApp(App):
         wl = self.query_one("#watchlist_list", ListView)
         wl.clear()
         for i in self.watchlist:
-            wl.append(ListItem(Label(i.symbol), name=i.symbol))
+            wl.append(ListItem(Label(f"⭐ {i.symbol}"), name=i.symbol))
 
         rl = self.query_one("#recent_list", ListView)
         rl.clear()
         for i in self.recent:
-            rl.append(ListItem(Label(i.symbol), name=i.symbol))
+            rl.append(ListItem(Label(f"🕒 {i.symbol}"), name=i.symbol))
+
+    async def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.list_view.id in ["watchlist_list", "recent_list"]:
+            symbol = event.item.name
+            # Try to find in watchlist first, then recent
+            instrument = next((i for i in self.watchlist if i.symbol == symbol), None)
+            if not instrument:
+                instrument = next((i for i in self.recent if i.symbol == symbol), None)
+
+            if instrument:
+                await self.select_instrument(instrument)
 
     async def search_instruments(self, query: str, exchange: str = "binance"):
         # Search both providers
@@ -189,12 +229,12 @@ class TerminalPriceApp(App):
 
     async def select_instrument(self, instrument: Instrument):
         self.current_instrument = instrument
-        # Add to recent
-        if instrument not in self.recent:
-            self.recent.insert(0, instrument)
-            self.recent = self.recent[:10]
-            self.persistence.save_recent(self.recent)
-            self.update_sidebars()
+        # Add to recent, remove existing if present to move to top
+        self.recent = [i for i in self.recent if i.symbol != instrument.symbol]
+        self.recent.insert(0, instrument)
+        self.recent = self.recent[:10]
+        self.persistence.save_recent(self.recent)
+        self.update_sidebars()
 
         await self.refresh_data()
 
@@ -203,11 +243,23 @@ class TerminalPriceApp(App):
             return
 
         inst = self.current_instrument
+        cache_key = f"{inst.provider}_{inst.exchange}_{inst.symbol}_{self.timeframe}"
+
+        status_bar = self.query_one("#status_bar", Static)
+        status_bar.update(f"Fetching {inst.symbol} ({self.timeframe})...")
+
         try:
-            if inst.provider == 'ccxt':
-                data = await self.crypto_provider.fetch_ohlcv(inst.exchange, inst.symbol, self.timeframe)
+            # Check cache
+            if cache_key in self._data_cache:
+                data = self._data_cache[cache_key]
             else:
-                data = await self.trad_provider.fetch_ohlcv(inst.symbol, self.timeframe)
+                if inst.provider == 'ccxt':
+                    data = await self.crypto_provider.fetch_ohlcv(inst.exchange, inst.symbol, self.timeframe)
+                else:
+                    data = await self.trad_provider.fetch_ohlcv(inst.symbol, self.timeframe)
+
+                # Cache the original data
+                self._data_cache[cache_key] = data
 
             # Normalize to target currency
             if inst.currency != self.target_currency:
@@ -222,9 +274,24 @@ class TerminalPriceApp(App):
 
             header = self.query_one("#instrument_header", Static)
             last_price = data[-1].close if data else 0
-            header.update(f"[bold]{inst.symbol}[/] ({inst.name}) - {self.timeframe} - [green]{last_price:.2f} {self.target_currency}[/]")
+            change = 0
+            if len(data) >= 2:
+                change = ((data[-1].close - data[-2].close) / data[-2].close) * 100
+
+            change_color = "green" if change >= 0 else "red"
+            header.update(
+                f"{inst.symbol} | {inst.name} | [bold]{last_price:.2f} {self.target_currency}[/] "
+                f"([{change_color}]{change:+.2f}%[/])"
+            )
+
+            status_bar.update(
+                f"Market: {inst.market_type.value.upper()} | Provider: {inst.provider} | "
+                f"Currency: {self.target_currency} | Timeframe: {self.timeframe} | "
+                f"Last Update: {datetime.now().strftime('%H:%M:%S')}"
+            )
         except Exception as e:
             self.notify(f"Error fetching data: {str(e)}", severity="error")
+            status_bar.update(f"[red]Error: {str(e)}[/]")
 
     def action_zoom_in(self):
         self.query_one("#main_chart", ChartWidget).zoom_in()
@@ -239,21 +306,43 @@ class TerminalPriceApp(App):
         self.query_one("#main_chart", ChartWidget).scroll_right()
 
     async def action_refresh(self):
+        # Clear cache for current instrument/timeframe and refresh
+        if self.current_instrument:
+            inst = self.current_instrument
+            cache_key = f"{inst.provider}_{inst.exchange}_{inst.symbol}_{self.timeframe}"
+            if cache_key in self._data_cache:
+                del self._data_cache[cache_key]
         await self.refresh_data()
 
     async def action_change_timeframe(self):
         # Simple cycle for now
-        timeframes = ["1m", "5m", "15m", "1h", "4h", "1d", "1w"]
-        idx = timeframes.index(self.timeframe)
+        timeframes = ["1m", "5m", "15m", "1h", "4h", "12h", "1d", "1w", "1mo"]
+        idx = timeframes.index(self.timeframe) if self.timeframe in timeframes else 3
         self.timeframe = timeframes[(idx + 1) % len(timeframes)]
         await self.refresh_data()
 
     async def action_add_to_watchlist(self):
-        if self.current_instrument and self.current_instrument not in self.watchlist:
-            self.watchlist.append(self.current_instrument)
+        if not self.current_instrument:
+            return
+
+        if any(i.symbol == self.current_instrument.symbol for i in self.watchlist):
+            self.notify(f"{self.current_instrument.symbol} is already in watchlist", severity="warning")
+            return
+
+        self.watchlist.append(self.current_instrument)
+        self.persistence.save_watchlist(self.watchlist)
+        self.update_sidebars()
+        self.notify(f"Added {self.current_instrument.symbol} to watchlist")
+
+    async def action_remove_from_watchlist(self):
+        wl = self.query_one("#watchlist_list", ListView)
+        if wl.index is not None and 0 <= wl.index < len(self.watchlist):
+            removed = self.watchlist.pop(wl.index)
             self.persistence.save_watchlist(self.watchlist)
             self.update_sidebars()
-            self.notify(f"Added {self.current_instrument.symbol} to watchlist")
+            self.notify(f"Removed {removed.symbol} from watchlist")
+        else:
+            self.notify("Select an item in the watchlist to remove", severity="warning")
 
     async def action_change_currency(self):
         currencies = ["USD", "EUR", "GBP", "JPY", "BTC"]
