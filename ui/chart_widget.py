@@ -13,22 +13,23 @@ class ChartWidget(Widget):
 
     def render(self):
         if not self.data:
-            return Panel(Text("No data available", justify="center"), title="Chart")
+            return Text("No data available", justify="center")
 
-        renderer = Renderer(self.data, self.size.width - 4, self.size.height - 4)
+        # Use full available size
+        renderer = Renderer(self.data, self.size.width, self.size.height)
         renderer.zoom_level = self.zoom_level
         renderer.scroll_offset = self.scroll_offset
 
         chart_lines = renderer.render()
         chart_text = Text.from_markup("\n".join(chart_lines))
 
-        return Panel(chart_text, title="Candlestick Chart")
+        return chart_text
 
     def zoom_in(self):
-        self.zoom_level = min(10.0, self.zoom_level * 1.2)
+        self.zoom_level = min(20.0, self.zoom_level * 1.2)
 
     def zoom_out(self):
-        self.zoom_level = max(0.1, self.zoom_level / 1.2)
+        self.zoom_level = max(0.5, self.zoom_level / 1.2)
 
     def scroll_left(self):
         self.scroll_offset = min(len(self.data) - 2, self.scroll_offset + max(1, int(5 / self.zoom_level)))
