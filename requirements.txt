@@ -1,0 +1,7 @@
+textual
+ccxt
+yfinance
+pandas
+httpx
+rich
+numpy
