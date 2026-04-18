@@ -4,6 +4,7 @@ from textual.widgets import Header, Footer, Static, Input, ListView, ListItem, L
 from textual.screen import ModalScreen
 from textual.binding import Binding
 from textual.reactive import reactive
+from textual.command import CommandPalette, Hit, Hits, Provider
 
 from data_providers.crypto import CryptoProvider
 from data_providers.traditional import TraditionalProvider
@@ -11,8 +12,11 @@ from utils.currency import CurrencyConverter
 from utils.persistence import PersistenceManager
 from models.instrument import Instrument, MarketType
 from ui.chart_widget import ChartWidget
+from ui.help_screen import HelpScreen
+from ui.alert_modal import AlertModal
 
 import asyncio
+from functools import partial
 from datetime import datetime
 
 class SearchModal(ModalScreen):
@@ -21,7 +25,7 @@ class SearchModal(ModalScreen):
     def compose(self) -> ComposeResult:
         yield Vertical(
             Label("Exchange (for Crypto)"),
-            Input(value="binance", placeholder="e.g. binance, coinbase...", id="exchange_input"),
+            Input(value="kraken", placeholder="e.g. binance, coinbase...", id="exchange_input"),
             Label("Search Symbol (e.g. BTC, AAPL, EURUSD)"),
             Input(placeholder="Enter symbol...", id="search_input"),
             Horizontal(
@@ -60,7 +64,7 @@ class SearchModal(ModalScreen):
             await self.run_search(event.value)
 
     async def run_search(self, query: str) -> None:
-        exchange = self.query_one("#exchange_input", Input).value or "binance"
+        exchange = self.query_one("#exchange_input", Input).value or "kraken"
         results = await self.app.search_instruments(query, exchange)
 
         # Apply filter
@@ -88,29 +92,85 @@ class SearchModal(ModalScreen):
         selected_name = event.item.name
         self.dismiss(selected_name)
 
+class AppCommandProvider(Provider):
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+
+        # Timeframe commands
+        timeframes = ["1m", "5m", "15m", "1h", "4h", "12h", "1d", "1w", "1mo"]
+        for tf in timeframes:
+            score = matcher.match(f"Timeframe: {tf}")
+            if score > 0:
+                yield Hit(
+                    score,
+                    matcher.highlight(f"Timeframe: {tf}"),
+                    partial(self.app.action_change_timeframe, tf),
+                    help=f"Switch chart timeframe to {tf}"
+                )
+
+        # Currency commands
+        currencies = ["USD", "EUR", "GBP", "JPY", "BTC"]
+        for cur in currencies:
+            score = matcher.match(f"Currency: {cur}")
+            if score > 0:
+                yield Hit(
+                    score,
+                    matcher.highlight(f"Currency: {cur}"),
+                    partial(self.app.action_change_currency, cur),
+                    help=f"Switch display currency to {cur}"
+                )
+
+        # Other actions
+        actions = [
+            ("Refresh Data", self.app.action_refresh, "Refresh market data"),
+            ("Set Price Alert", self.app.action_set_alert, "Set a price alert for current instrument"),
+            ("Add to Watchlist", self.app.action_add_to_watchlist, "Add current symbol to watchlist"),
+            ("Toggle Help", self.app.action_help, "Show help screen"),
+            ("Quit", self.app.action_quit, "Exit application"),
+        ]
+        for name, action, help_text in actions:
+            score = matcher.match(name)
+            if score > 0:
+                yield Hit(
+                    score,
+                    matcher.highlight(name),
+                    action,
+                    help=help_text
+                )
+
 class TerminalPriceApp(App):
+    COMMANDS = App.COMMANDS | {AppCommandProvider}
     CSS = """
     #main_container {
         layout: grid;
         grid-size: 2 1;
-        grid-columns: 1fr 4fr;
+        grid-columns: 1fr 5fr;
     }
     #instrument_header {
         height: 3;
-        background: $primary;
+        background: $boost;
         color: $text;
         content-align: center middle;
         text-style: bold;
+        border-bottom: solid $primary;
     }
     #status_bar {
         height: 1;
-        background: $accent;
-        color: $text;
+        background: $boost;
+        color: $text-muted;
         padding: 0 1;
     }
     #sidebar {
-        background: $panel;
-        border-right: tall $primary;
+        background: $boost;
+        border-right: solid $primary;
+        padding: 1;
+    }
+    #sidebar Label {
+        text-style: bold;
+        background: $primary;
+        width: 100%;
+        padding: 0 1;
+        margin-top: 1;
     }
     #search_container {
         padding: 1 2;
@@ -132,15 +192,37 @@ class TerminalPriceApp(App):
         height: 10;
         margin-top: 1;
     }
+    #alert_container {
+        padding: 1 2;
+        background: $panel;
+        border: thick $primary;
+        width: 40;
+        height: 15;
+        align: center middle;
+    }
+    #help_container {
+        padding: 1 2;
+        background: $panel;
+        border: thick $primary;
+        width: 50;
+        height: 25;
+        align: center middle;
+    }
+    .modal_buttons {
+        margin-top: 1;
+    }
     """
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("/", "search", "Search"),
+        Binding("ctrl+p", "command_palette", "Commands"),
+        Binding("question_mark", "help", "Help"),
         Binding("t", "change_timeframe", "Timeframe"),
         Binding("c", "change_currency", "Currency"),
         Binding("a", "add_to_watchlist", "Add Watchlist"),
         Binding("d", "remove_from_watchlist", "Remove Watchlist"),
+        Binding("l", "set_alert", "Alert"),
         Binding("plus", "zoom_in", "Zoom In"),
         Binding("minus", "zoom_out", "Zoom Out"),
         Binding("left", "scroll_left", "Scroll Left"),
@@ -161,6 +243,7 @@ class TerminalPriceApp(App):
         self.last_search_results = []
         self.watchlist = []
         self.recent = []
+        self.alerts = []
         self._data_cache = {}
 
     def compose(self) -> ComposeResult:
@@ -184,7 +267,7 @@ class TerminalPriceApp(App):
         self.update_sidebars()
 
         # Default instrument
-        await self.select_instrument(Instrument("BTC/USDT", "Bitcoin", MarketType.CRYPTO, "ccxt", "USDT", "binance"))
+        await self.select_instrument(Instrument("BTC/USDT", "Bitcoin", MarketType.CRYPTO, "ccxt", "USDT", "kraken"))
         self.set_interval(30, self.refresh_data)
 
     def update_sidebars(self):
@@ -284,6 +367,17 @@ class TerminalPriceApp(App):
                 f"([{change_color}]{change:+.2f}%[/])"
             )
 
+            # Check Alerts
+            triggered = []
+            for alert in self.alerts:
+                if alert['symbol'] == inst.symbol:
+                    if (alert['type'] == 'above' and last_price >= alert['price']) or \
+                       (alert['type'] == 'below' and last_price <= alert['price']):
+                        self.notify(f"ALERT: {inst.symbol} hit {alert['price']:.2f}!", severity="warning")
+                        triggered.append(alert)
+
+            self.alerts = [a for a in self.alerts if a not in triggered]
+
             status_bar.update(
                 f"Market: {inst.market_type.value.upper()} | Provider: {inst.provider} | "
                 f"Currency: {self.target_currency} | Timeframe: {self.timeframe} | "
@@ -305,6 +399,9 @@ class TerminalPriceApp(App):
     def action_scroll_right(self):
         self.query_one("#main_chart", ChartWidget).scroll_right()
 
+    async def action_help(self):
+        self.push_screen(HelpScreen())
+
     async def action_refresh(self):
         # Clear cache for current instrument/timeframe and refresh
         if self.current_instrument:
@@ -314,12 +411,37 @@ class TerminalPriceApp(App):
                 del self._data_cache[cache_key]
         await self.refresh_data()
 
-    async def action_change_timeframe(self):
-        # Simple cycle for now
+    async def action_change_timeframe(self, tf: str = None):
         timeframes = ["1m", "5m", "15m", "1h", "4h", "12h", "1d", "1w", "1mo"]
-        idx = timeframes.index(self.timeframe) if self.timeframe in timeframes else 3
-        self.timeframe = timeframes[(idx + 1) % len(timeframes)]
+        if tf and tf in timeframes:
+            self.timeframe = tf
+        else:
+            idx = timeframes.index(self.timeframe) if self.timeframe in timeframes else 3
+            self.timeframe = timeframes[(idx + 1) % len(timeframes)]
         await self.refresh_data()
+
+    async def action_set_alert(self):
+        if not self.current_instrument or not self.current_instrument.symbol:
+            return
+
+        inst = self.current_instrument
+        cache_key = f"{inst.provider}_{inst.exchange}_{inst.symbol}_{self.timeframe}"
+        if cache_key not in self._data_cache or not self._data_cache[cache_key]:
+            return
+
+        last_price = self._data_cache[cache_key][-1].close
+
+        def on_alert_set(price: float | None):
+            if price:
+                alert_type = 'above' if price > last_price else 'below'
+                self.alerts.append({
+                    'symbol': inst.symbol,
+                    'price': price,
+                    'type': alert_type
+                })
+                self.notify(f"Alert set for {inst.symbol} at {price:.2f}")
+
+        self.push_screen(AlertModal(last_price, inst.symbol), on_alert_set)
 
     async def action_add_to_watchlist(self):
         if not self.current_instrument:
@@ -344,10 +466,13 @@ class TerminalPriceApp(App):
         else:
             self.notify("Select an item in the watchlist to remove", severity="warning")
 
-    async def action_change_currency(self):
+    async def action_change_currency(self, cur: str = None):
         currencies = ["USD", "EUR", "GBP", "JPY", "BTC"]
-        idx = currencies.index(self.target_currency) if self.target_currency in currencies else 0
-        self.target_currency = currencies[(idx + 1) % len(currencies)]
+        if cur and cur in currencies:
+            self.target_currency = cur
+        else:
+            idx = currencies.index(self.target_currency) if self.target_currency in currencies else 0
+            self.target_currency = currencies[(idx + 1) % len(currencies)]
         await self.refresh_data()
 
     async def on_shutdown(self):

@@ -11,7 +11,7 @@ class CandlestickChart:
         self.width = width
         self.height = height
         self.zoom_level = 1.0
-        self.scroll_offset = 0  # Number of candles to skip from the end
+        self.scroll_offset = 0
 
     def render(self) -> List[str]:
         if not self.data:
@@ -56,12 +56,15 @@ class CandlestickChart:
 
             # --- Render Candlestick ---
             def to_y_price(price):
-                return int((chart_height - 1) * (1 - (price - min_price) / price_range))
+                return (chart_height - 1) * (1 - (price - min_price) / price_range)
 
-            y_open = to_y_price(d.open)
-            y_close = to_y_price(d.close)
-            y_high = to_y_price(d.high)
-            y_low = to_y_price(d.low)
+            y_open_raw = to_y_price(d.open)
+            y_close_raw = to_y_price(d.close)
+            y_high_raw = to_y_price(d.high)
+            y_low_raw = to_y_price(d.low)
+
+            y_open, y_close = int(y_open_raw), int(y_close_raw)
+            y_high, y_low = int(y_high_raw), int(y_low_raw)
 
             is_bullish = d.close >= d.open
             color = "green" if is_bullish else "red"
@@ -69,43 +72,69 @@ class CandlestickChart:
             # Draw wick
             for y in range(min(y_high, y_low), max(y_high, y_low) + 1):
                 if 0 <= y < chart_height:
-                    canvas[y][x + candle_width // 2] = '│'
+                    canvas[y][x + candle_width // 2] = f"[{color}]│[/]"
 
             # Draw body
             body_top = min(y_open, y_close)
             body_bottom = max(y_open, y_close)
-            for y in range(body_top, body_bottom + 1):
-                if 0 <= y < chart_height:
+            if body_top == body_bottom: # Doji
+                if 0 <= body_top < chart_height:
                     for dx in range(candle_width):
-                        canvas[y][x + dx] = f"[{color}]█[/]"
+                        canvas[body_top][x + dx] = f"[{color}]─[/]"
+            else:
+                for y in range(body_top, body_bottom + 1):
+                    if 0 <= y < chart_height:
+                        char = '█'
+                        # Use partial blocks for more precision if candle_width is 1?
+                        # Maybe just stick to █ for body for now.
+                        for dx in range(candle_width):
+                            canvas[y][x + dx] = f"[{color}]{char}[/]"
 
-            # --- Render Volume ---
-            vol_y_size = int((d.volume / max_volume) * (volume_height - 1))
-            for v_off in range(vol_y_size + 1):
+            # --- Render Volume (using block characters for better resolution) ---
+            vol_y_max = volume_height * 8 # 8 levels per char using █ ▇ ▆ ▅ ▄ ▃ ▂
+            vol_level = int((d.volume / max_volume) * (vol_y_max - 1))
+
+            blocks = [" ", " ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+
+            full_blocks = vol_level // 8
+            remainder = vol_level % 8
+
+            for v_off in range(volume_height):
                 y = self.height - time_axis_height - 1 - v_off
-                if y >= chart_height:
-                    for dx in range(candle_width):
-                        canvas[y][x + dx] = f"[{color}]┃[/]"
+                if y < chart_height: break
 
-            # --- Render Time Axis (Partial) ---
+                if v_off < full_blocks:
+                    char = "█"
+                elif v_off == full_blocks:
+                    char = blocks[remainder]
+                else:
+                    char = " "
+
+                if char != " ":
+                    for dx in range(candle_width):
+                        canvas[y][x + dx] = f"[dim {color}]{char}[/]"
+
+            # --- Render Time Axis ---
             if i % 5 == 0:
-                time_str = d.timestamp.strftime("%H:%M" if self.zoom_level > 1 else "%d/%m")
+                time_str = d.timestamp.strftime("%H:%M" if self.zoom_level > 2 else "%d/%m")
                 for j, char in enumerate(time_str):
                     if x + j < chart_width:
-                        canvas[self.height - 1][x + j] = char
+                        canvas[self.height - 1][x + j] = f"[dim]{char}[/]"
 
         # --- Render Price Axis (Right) ---
         for y in range(chart_height):
             price = max_price - (y / (chart_height - 1)) * price_range
-            price_str = f" {price:10.2f}"
-            for j, char in enumerate(price_str):
-                if chart_width + j < self.width:
-                    canvas[y][chart_width + j] = f"[dim]{char}[/]"
+            # Format price nicely
+            if price >= 1000: price_str = f" {price:10.0f}"
+            elif price >= 1: price_str = f" {price:10.2f}"
+            else: price_str = f" {price:10.6f}"
 
-        # Add vertical separator for price axis
+            for j, char in enumerate(price_str):
+                if chart_width + 1 + j < self.width:
+                    canvas[y][chart_width + 1 + j] = f"[dim]{char}[/]"
+
+        # Add vertical separator
         for y in range(self.height - time_axis_height):
             canvas[y][chart_width] = '│'
 
         return ["".join(row) for row in canvas]
-
-# For Textual integration, we'll likely wrap this in a Widget
